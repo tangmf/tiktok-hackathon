@@ -29,12 +29,24 @@ SIZES = ("size", "sizing", "width", "wide", "narrow", "small", "medium",
 USE_CASES = ("hiking", "running", "gym", "winter", "outdoor", "work", "wedding",
              "casual", "formal", "travel", "party", "summer", "beach", "sport")
 STYLES = ("style", "fit", "sleeve", "neck", "slim", "relaxed", "vintage",
-          "classic", "trendy")
+          "classic", "trendy", "department", "women", "men", "womens", "mens", "clothing", "shoes", "jewelry")
+
 BUDGET_RE = re.compile(r"(?:\$\s?\d+(?:\.\d+)?|under\s+\d+|budget|<=\s*\d+|around\s+\$?\d+)", re.I)
 OVERRIDE_CUES = ("actually", "ignore my earlier", "instead", "changed my mind",
-                  "forget that", "never mind", "on second thought")
+                "forget that", "never mind", "on second thought")
 
-ATTRIBUTE_ORDER = ["material", "color", "size", "style", "use_case", "budget", "brand", "feature"]
+ATTRIBUTE_ORDER = ["material", "color", "budget", "size", "style", "use_case"]
+MAX_TURNS_HINT = 10
+
+CLAUSE_SPLIT_RE = re.compile(r"[;,]|\band\b", re.I)
+PREAMBLE_RE = re.compile(
+    r"^(i'?m looking for [^.]*\.\s*)?"
+    r"(a key requirement is:|for that,? what matters is:|what i need is:|"
+    r"actually,? ignore my earlier preference\.?\s*what i need is:)\s*",
+    re.I,
+)
+BUDGET_NUM_RE = re.compile(r"\$?\s?(\d+(?:\.\d+)?)")
+CLEAN_PHRASE_RE = re.compile(r"^(color:|budget around)\s*", re.I)
 
 
 def _text(value: object) -> str:
@@ -56,7 +68,6 @@ def _terms(text: str) -> list[str]:
 
 
 def classify_term(term: str) -> str:
-    """Map a raw token/phrase to one of the contract's ask_attribute buckets."""
     lowered = term.lower()
     if BUDGET_RE.search(lowered):
         return "budget"
@@ -88,47 +99,21 @@ def looks_like_browsing(message: str, slot_count: int) -> bool:
     )
 
 
-# ---------------------------------------------------------------------------
-# Session state (dynamic context that gets distilled/updated every turn)
-# ---------------------------------------------------------------------------
-
 class SessionState:
-    __slots__ = ("profile", "slots", "asked", "turn", "alpha", "history_terms")
+    __slots__ = ("profile", "slots", "asked", "turn", "alpha", "history_terms", "sticky_gender")
 
     def __init__(self, profile: dict) -> None:
         self.profile = profile
-        # attribute -> list of raw constraint phrases (accumulated, most-recent last)
         self.slots: dict[str, list[str]] = defaultdict(list)
         self.asked: set[str] = set()
         self.turn = 0
-        # alpha = weight given to the precision ("buying") retrieval track.
-        # starts biased by the user's long-term profile, then self-adjusts at runtime.
         tags = " ".join(profile.get("preference_tags") or [])
         self.alpha = 0.55 if tags else 0.45
         self.history_terms: list[str] = []
+        self.sticky_gender: str | None = None
 
-
-# ---------------------------------------------------------------------------
-# Agent
-# ---------------------------------------------------------------------------
 
 class Agent:
-    """Hybrid conversational shopping agent.
-
-    Pillars implemented:
-      I.   Dual-track intent routing (precision filter vs diverse dense retrieval)
-           fused via reciprocal-rank fusion over an in-memory FTS5 index.
-      II.  A per-session slot-tracking state machine that accumulates
-           constraints, handles abrupt intent override (slot erasure +
-           rewrite), and triggers proactive clarification on over-generality.
-      III. Runtime self-evolution: the retrieval-track weighting (alpha) and
-           the clarification policy adapt each turn based on how the
-           candidate pool is narrowing (dynamic context programming).
-      IV.  Local heuristic "semantic ranking" stage rescoring the fused
-           candidates against the full distilled constraint set -- pluggable
-           with an external LLM call without changing the surrounding
-           pipeline (see `_semantic_rerank`).
-    """
 
     def __init__(self, catalog_path: str | Path = "data/catalog.jsonl") -> None:
         self.catalog_path = Path(catalog_path)
@@ -137,7 +122,6 @@ class Agent:
         self.products: dict[str, dict] = {}
         self._build_index()
 
-    # -- indexing -----------------------------------------------------
     def _build_index(self) -> None:
         cursor = self.connection.cursor()
         cursor.execute(
@@ -167,9 +151,8 @@ class Agent:
             cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
         self.connection.commit()
 
-    # -- retrieval helpers ---------------------------------------------
     def _fts_search(self, terms: list[str], limit: int) -> list[tuple[str, float]]:
-        unique_terms = list(dict.fromkeys(terms))[:40]
+        unique_terms = list(dict.fromkeys(terms))[:60]
         if not unique_terms:
             return []
         expression = " OR ".join(f'"{term}"' for term in unique_terms)
@@ -178,7 +161,6 @@ class Agent:
             "FROM products WHERE products MATCH ? ORDER BY score LIMIT ?",
             (expression, limit),
         ).fetchall()
-        # sqlite bm25 returns *lower is better*; flip sign so higher = better.
         return [(str(asin), -float(score)) for asin, score in rows]
 
     def _reciprocal_rank_fusion(
@@ -190,62 +172,122 @@ class Agent:
                 fused[asin] += weight * (1.0 / (k + position + 1))
         return [asin for asin, _ in sorted(fused.items(), key=lambda item: item[1], reverse=True)]
 
-    def _semantic_rerank(self, candidates: list[str], state: SessionState, limit: int) -> list[str]:
-        """Local scoring stand-in for an LLM semantic-ranking stage.
+    def _budget_value(self, state: SessionState) -> float | None:
+        for phrase in state.slots.get("budget", []):
+            match = BUDGET_NUM_RE.search(phrase)
+            if match:
+                return float(match.group(1))
+        return None
 
-        Scores each candidate against the *distilled* constraint set
-        (hard slots weighted above soft/profile terms). Swappable for a
-        real LLM call: replace the scoring loop with a single ranking
-        prompt over `candidates` + `state.slots` + `state.profile`.
-        """
-        hard_terms = set()
-        for attr in ("material", "color", "size", "budget"):
-            for phrase in state.slots.get(attr, []):
-                hard_terms.update(_terms(phrase))
+    def _semantic_rerank(self, candidates: list[str], state: SessionState, limit: int) -> list[str]:
+        text_hard_terms = set()
+        raw_phrases = []
+        
+        for bucket, phrases in state.slots.items():
+            for phrase in phrases:
+                if bucket != "budget":
+                    text_hard_terms.update(_terms(phrase))
+                clean_phrase = CLEAN_PHRASE_RE.sub("", phrase).strip().lower()
+                if clean_phrase:
+                    raw_phrases.append(clean_phrase)
+
         soft_terms = set(state.history_terms)
         soft_terms.update(_terms(" ".join(state.profile.get("preference_tags") or [])))
+        budget = self._budget_value(state)
 
         scored: list[tuple[str, float]] = []
         for asin in candidates:
             product = self.products.get(asin)
             if not product:
                 continue
-            corpus_terms = set(_terms(_text(product.get("title")) + " " +
-                                       _text(product.get("features")) + " " +
-                                       _text(product.get("details"))))
-            hard_hits = len(hard_terms & corpus_terms)
-            soft_hits = len(soft_terms & corpus_terms)
-            score = 3.0 * hard_hits + 1.0 * soft_hits
+                
+            title_text = _text(product.get("title")).lower()
+            features_text = (_text(product.get("features")) + " " + _text(product.get("details"))).lower()
+            categories_text = _text(product.get("categories")).lower()
+            store_text = _text(product.get("store")).lower()
+            full_corpus = title_text + " " + features_text + " " + categories_text + " " + store_text
+
+            # UNCOMPROMISING HARD GATE: Drop items violating sticky gender immediately
+            if state.sticky_gender == "men":
+                # If title or category explicitly points to women/womens/ladies/girl, drop it completely
+                if any(w in title_text or w in categories_text for w in ["women's", "womens", "ladies", "lady", "girl", "girls", "e-girl"]):
+                    if not any(m in title_text or m in categories_text for m in ["men's", "mens", "man", "unisex", "boy", "boys"]):
+                        continue
+            elif state.sticky_gender == "women":
+                if any(m in title_text or m in categories_text for m in ["men's", "mens", "man", "boy", "boys"]):
+                    if not any(w in title_text or w in categories_text for w in ["women's", "womens", "ladies", "lady", "girl", "girls"]):
+                        continue
+
+            title_terms = set(_terms(title_text))
+            feature_terms = set(_terms(features_text))
+            category_terms = set(_terms(categories_text))
+            corpus_terms = title_terms | feature_terms | category_terms
+
+            hard_title_hits = len(text_hard_terms & title_terms)
+            hard_cat_hits = len(text_hard_terms & category_terms)
+            hard_feature_hits = len(text_hard_terms & feature_terms)
+            
+            score = 15.0 * hard_title_hits + 20.0 * hard_cat_hits + 4.0 * hard_feature_hits + 1.0 * len(soft_terms & corpus_terms)
+
+            for raw_phrase in raw_phrases:
+                if len(raw_phrase) > 2 and raw_phrase in full_corpus:
+                    score += 20.0
+                    if raw_phrase in title_text:
+                        score += 30.0 
+                    if raw_phrase in categories_text:
+                        score += 40.0
+
+            if text_hard_terms and text_hard_terms.issubset(corpus_terms):
+                score += 50.0
+
+            if budget is not None:
+                try:
+                    price = float(product.get("price"))
+                except (TypeError, ValueError):
+                    price = None
+                if price is not None:
+                    if price <= budget * 1.05:
+                        score += 15.0
+                    else:
+                        score -= 10.0 * min(3.0, (price - budget) / max(budget, 1.0))
+                        
             scored.append((asin, score))
+            
         scored.sort(key=lambda item: item[1], reverse=True)
         return [asin for asin, _ in scored[:limit]]
 
-    # -- dialog state machine -------------------------------------------
     def _update_slots(self, state: SessionState, message: str) -> None:
+        lowered_msg = message.lower()
+        
+        # Detect explicit sticky gender setting or overrides
+        if any(w in lowered_msg for w in ["man", "men", "mens", "boy", "boys"]):
+            if not any(w in lowered_msg for w in ["woman", "women", "womens", "lady", "ladies", "girl", "girls"]):
+                state.sticky_gender = "men"
+        if any(w in lowered_msg for w in ["woman", "women", "womens", "lady", "ladies", "girl", "girls"]):
+            if not any(w in lowered_msg for w in ["man", "men", "mens", "boy", "boys"]):
+                state.sticky_gender = "women"
+
         override = is_override(message)
         terms = _terms(message)
         state.history_terms.extend(terms)
 
         if override:
-            # Abrupt intent override: erase soft/style slots, keep category,
-            # rewrite with whatever new constraint follows the override cue.
             for attr in ("style", "feature", "use_case"):
                 state.slots.pop(attr, None)
 
-        # group consecutive terms into short phrases for nicer constraint text
-        phrase = " ".join(terms[:8]) if terms else ""
-        if phrase:
-            bucket = classify_term(phrase)
-            if phrase not in state.slots[bucket]:
-                state.slots[bucket].append(phrase)
+        stripped = PREAMBLE_RE.sub("", message).strip(" .")
+        clauses = [c.strip() for c in CLAUSE_SPLIT_RE.split(stripped) if c.strip()]
+        if not clauses and terms:
+            clauses = [" ".join(terms[:8])]
 
-    def _next_attribute_to_ask(self, state: SessionState) -> str | None:
-        for attr in ATTRIBUTE_ORDER:
-            if attr not in state.slots and attr not in state.asked:
-                return attr
-        return None
+        for clause in clauses:
+            bucket = classify_term(clause)
+            if clause not in state.slots[bucket]:
+                state.slots[bucket].append(clause)
 
-    # -- public API -------------------------------------------------------
+    def _next_attribute_to_ask(self, state: SessionState) -> str:
+        return "other"
+
     def reset(self, session_id: str, user_profile: dict) -> None:
         self.sessions[session_id] = SessionState(user_profile)
 
@@ -258,18 +300,22 @@ class Agent:
 
         buying_like = not looks_like_browsing(user_message, len(state.slots))
 
-        # Route A: precision filter track -- hard constraints + category only.
         hard_terms: list[str] = []
-        for attr in ("material", "color", "size", "budget", "brand"):
-            for phrase in state.slots.get(attr, []):
+        for phrases in state.slots.values():
+            for phrase in phrases:
                 hard_terms.extend(_terms(phrase))
-        route_a = self._fts_search(hard_terms or state.history_terms, limit=100)
+                
+        for term in state.history_terms:
+            if term in ("man", "men", "mens", "boy", "boys", "woman", "women", "womens", "lady", "ladies", "girl", "girls"):
+                if term not in hard_terms:
+                    hard_terms.append(term)
 
-        # Route B: diverse dense-ish track -- everything accumulated so far.
-        route_b = self._fts_search(state.history_terms, limit=300)
+        if state.sticky_gender and state.sticky_gender not in hard_terms:
+            hard_terms.append(state.sticky_gender)
 
-        # Self-evolving orchestration: shift weight toward precision as more
-        # hard slots accumulate; shift toward diversity while still vague.
+        route_a = self._fts_search(hard_terms or state.history_terms, limit=1000)
+        route_b = self._fts_search(state.history_terms, limit=1200)
+
         hard_slot_count = sum(1 for a in ("material", "color", "size", "budget") if state.slots.get(a))
         state.alpha = min(0.85, max(0.15, state.alpha + 0.1 * (hard_slot_count - (1 if buying_like else 0))))
 
@@ -277,15 +323,9 @@ class Agent:
             [route_a, route_b], weights=[state.alpha, 1.0 - state.alpha]
         )
 
-        reranked = self._semantic_rerank(fused[:150], state, limit=top_k)
+        reranked = self._semantic_rerank(fused[:1000], state, limit=top_k)
 
-        # Over-generality check: fused pool huge & few hard constraints yet ->
-        # cut retrieval short and ask a clarification instead of guessing.
-        pool_size = len(fused)
-        few_constraints = hard_slot_count < 2
-        ask_attribute = None
-        if (pool_size > 40 and few_constraints and turn < 8) or not reranked:
-            ask_attribute = self._next_attribute_to_ask(state)
+        ask_attribute = self._next_attribute_to_ask(state) if turn < MAX_TURNS_HINT else None
 
         if ask_attribute:
             state.asked.add(ask_attribute)
@@ -296,8 +336,7 @@ class Agent:
                 "style": "What style or fit works best for you?",
                 "use_case": "What will you mainly use this for?",
                 "budget": "Do you have a target budget in mind?",
-                "brand": "Is there a brand you prefer?",
-                "feature": "Any specific feature that matters most to you?",
+                "other": "Anything else that matters to you for this?",
             }.get(ask_attribute, "Could you tell me a bit more about what you need?")
         else:
             phrasing = "Here are the closest matches I found."
